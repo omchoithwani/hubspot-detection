@@ -114,6 +114,7 @@ class DetectionResult:
     hubspot_tier: str = "unknown"
     detected_products: list = field(default_factory=list)
     form_ids: list = field(default_factory=list, repr=False)
+    cdn_masking: str = field(default="", repr=False)  # set by _check_headers, used by check_content_hub
 
     def confidence_score(self) -> int:
         """Numeric score based on number and strength of signals."""
@@ -347,6 +348,20 @@ def _check_headers(resp: requests.Response, result: DetectionResult):
     if "__hs" in cookies or "hubspot" in cookies:
         result.signals.append("HTTP Header: HubSpot cookie detected")
 
+    # CDN detection — used later by check_content_hub to flag inconclusive IP checks
+    server = resp_headers.get("server", "")
+    via = resp_headers.get("via", "")
+    if "cf-ray" in resp_headers or "cf-cache-status" in resp_headers or "cloudflare" in server:
+        result.cdn_masking = "Cloudflare"
+    elif "x-fastly-request-id" in resp_headers or "fastly" in server or "fastly" in via:
+        result.cdn_masking = "Fastly"
+    elif "x-akamai-edgescape" in resp_headers or "akamai" in server or "akamai" in via:
+        result.cdn_masking = "Akamai"
+    elif "x-sucuri-id" in resp_headers or "sucuri" in server:
+        result.cdn_masking = "Sucuri"
+    elif "x-iinfo" in resp_headers or "imperva" in server or "incapsula" in server:
+        result.cdn_masking = "Imperva"
+
 
 def _check_html(html: str, result: DetectionResult):
     """Check HTML content for HubSpot markers."""
@@ -381,12 +396,6 @@ def _check_html(html: str, result: DetectionResult):
         result.signals.append("Sales Hub Starter+: meetings widget detected")
         if "Sales Hub Starter+" not in result.detected_products:
             result.detected_products.append("Sales Hub Starter+")
-
-    # hubs.ly / hubs.li / hubs.la shortener links → Marketing Hub Pro
-    if re.search(r"hubs\.(ly|li|la)/", html, re.IGNORECASE):
-        result.signals.append("Marketing Hub Pro: HubSpot social publishing shortener (hubs.ly/li/la)")
-        if "Marketing Hub Pro" not in result.detected_products:
-            result.detected_products.append("Marketing Hub Pro")
 
     # Signal #10 (HTML part): Breeze Customer Agent chat widget
     if "hubspot-conversations-iframe" in html:
@@ -539,7 +548,13 @@ def check_content_hub(domain: str, result: DetectionResult, hubspot_ranges: list
                             result.signals.append(f"Portal ID: {pid}")
                     except Exception:
                         pass
-                break
+                return
+
+    # No HubSpot IPs found — flag if a CDN is masking the origin
+    if result.cdn_masking:
+        result.signals.append(
+            f"Content Hub: {result.cdn_masking} CDN detected — IP check inconclusive, may be hosted on HubSpot"
+        )
 
 
 def check_service_hub(domain: str, result: DetectionResult, hubspot_ranges: list):
