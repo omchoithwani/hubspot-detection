@@ -22,6 +22,16 @@ from hubspot_api import (
     fetch_companies_missing_property,
     update_company_property,
 )
+from google_sheets import get_client as _gsheets_get_client, get_worksheet, upsert_results, extract_sheet_id
+
+@st.cache_resource
+def _get_sheets_client():
+    try:
+        info = dict(st.secrets["gcp_service_account"])
+        return _gsheets_get_client(info)
+    except Exception:
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -87,6 +97,9 @@ st.markdown(
 # ---------------------------------------------------------------------------
 # Sidebar — instructions & settings
 # ---------------------------------------------------------------------------
+_sheets_client = None
+_sheets_sheet_id = None
+
 with st.sidebar:
     st.header("How to use")
     st.markdown(
@@ -136,6 +149,47 @@ with st.sidebar:
         - **Portal ID extraction** — identifies the HubSpot account
         """
     )
+
+    st.divider()
+    st.subheader("Google Sheets Sync")
+    _sheet_url_input = st.text_input(
+        "Sheet ID or URL",
+        placeholder="https://docs.google.com/spreadsheets/d/...",
+        help=(
+            "Paste your Google Sheet URL or ID. Results will be upserted here "
+            "after every detection run. Share the sheet with your service account email first."
+        ),
+    )
+    if _sheet_url_input.strip():
+        _sheets_client = _get_sheets_client()
+        _sheets_sheet_id = extract_sheet_id(_sheet_url_input)
+        if _sheets_client is None:
+            st.warning(
+                "No service account found. Add **[gcp_service_account]** to your "
+                "`.streamlit/secrets.toml` file."
+            )
+        else:
+            try:
+                _ws_test = get_worksheet(_sheets_client, _sheets_sheet_id)
+                st.success("Connected to Google Sheets")
+            except Exception as _e:
+                st.error(f"Cannot open sheet: {_e}")
+                _sheets_client = None
+
+def _sync_to_sheets(results: list, label: str = "") -> None:
+    """Upsert results into the configured Google Sheet and show a status message."""
+    if not _sheets_client or not _sheets_sheet_id:
+        return
+    try:
+        ws = get_worksheet(_sheets_client, _sheets_sheet_id)
+        updated, appended = upsert_results(ws, results)
+        msg = f"Google Sheets: {updated} row(s) updated, {appended} new row(s) added"
+        if label:
+            msg = f"{label} — {msg}"
+        st.info(msg)
+    except Exception as e:
+        st.warning(f"Google Sheets sync failed: {e}")
+
 
 # ---------------------------------------------------------------------------
 # Tabs — Single Domain vs Bulk CSV
@@ -203,6 +257,8 @@ with tab_single:
                         st.markdown(f"- {sig}")
                 else:
                     st.info("No HubSpot signals detected.")
+
+                _sync_to_sheets([result], label=domain)
 
 # ---------------------------------------------------------------------------
 # Tab 2 — Bulk CSV upload
@@ -300,6 +356,8 @@ with tab_bulk:
             elapsed = time.time() - start_time
             progress_bar.progress(1.0, text="Done!")
             status_text.success(f"Finished checking {len(entries)} domains in {elapsed:.1f}s")
+
+            _sync_to_sheets(results)
 
             # Sort: HubSpot users first, then by confidence
             confidence_order = {"high": 0, "medium": 1, "low": 2, "none": 3}
@@ -573,5 +631,6 @@ with tab_hubspot:
                         f"Done! Checked {len(results)} companies and updated "
                         f"{updated} records in {elapsed:.1f}s."
                     )
+                    _sync_to_sheets([r for _, r in results])
     else:
         st.info("Enter your HubSpot Private App token above to get started.")
