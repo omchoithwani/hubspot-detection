@@ -19,10 +19,9 @@ import logging
 import re
 import sys
 import threading
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -33,7 +32,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Request configuration
 REQUEST_TIMEOUT = 15
 MAX_WORKERS = 10
 USER_AGENT = (
@@ -42,7 +40,6 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# HubSpot detection signatures
 HUBSPOT_DNS_CNAMES = [
     "hubspot.net",
     "hubspot.com",
@@ -91,12 +88,16 @@ HUBSPOT_META_INDICATORS = [
     "hubs-content-id",
 ]
 
-# DNS record types to check for MX-based detection
 HUBSPOT_MX_DOMAINS = [
     "hubspot.com",
 ]
 
-# Module-level cache for HubSpot IP ranges
+# Keywords used to find high-value secondary pages (contact, demo, pricing)
+SECONDARY_PAGE_KEYWORDS = (
+    "contact", "demo", "pricing", "get-started", "trial",
+    "book", "request", "schedule", "talk-to-sales", "resources",
+)
+
 _HUBSPOT_IP_RANGES: list | None = None
 _HUBSPOT_IP_LOCK = threading.Lock()
 
@@ -107,17 +108,18 @@ class DetectionResult:
     company: str
     domain: str
     uses_hubspot: bool = False
-    confidence: str = "none"  # none, low, medium, high
+    confidence: str = "none"
     signals: list = field(default_factory=list)
     hubspot_portal_id: str = ""
     error: str = ""
     hubspot_tier: str = "unknown"
     detected_products: list = field(default_factory=list)
+    # Internal fields — not exported to CSV
     form_ids: list = field(default_factory=list, repr=False)
-    cdn_masking: str = field(default="", repr=False)  # set by _check_headers, used by check_content_hub
+    gtm_ids: list = field(default_factory=list, repr=False)
+    cdn_masking: str = field(default="", repr=False)
 
     def confidence_score(self) -> int:
-        """Numeric score based on number and strength of signals."""
         score = 0
         product_keywords = ("Content Hub", "Marketing Hub", "Service Hub", "Sales Hub", "Breeze")
         for signal in self.signals:
@@ -132,7 +134,6 @@ class DetectionResult:
         return score
 
     def compute_confidence(self):
-        """Set confidence level based on accumulated signals."""
         score = self.confidence_score()
         if score == 0:
             self.confidence = "none"
@@ -148,7 +149,6 @@ class DetectionResult:
             self.uses_hubspot = True
 
     def compute_tier(self):
-        """Set hubspot_tier based on detected_products."""
         if not self.uses_hubspot:
             self.hubspot_tier = "unknown"
             return
@@ -165,7 +165,6 @@ class DetectionResult:
 
 
 def normalize_domain(domain: str) -> str:
-    """Normalize a domain string for consistent checking."""
     domain = domain.strip().lower()
     if "://" in domain:
         parsed = urlparse(domain)
@@ -176,7 +175,7 @@ def normalize_domain(domain: str) -> str:
 
 
 def get_hubspot_ip_ranges() -> list:
-    """Fetch HubSpot IP ranges from ARIN API, cached at module level."""
+    """Fetch HubSpot IP ranges from ARIN (org HUBSP-8), cached for the process lifetime."""
     global _HUBSPOT_IP_RANGES
     with _HUBSPOT_IP_LOCK:
         if _HUBSPOT_IP_RANGES is not None:
@@ -190,8 +189,7 @@ def get_hubspot_ip_ranges() -> list:
                 timeout=REQUEST_TIMEOUT,
             )
             resp.raise_for_status()
-            data = resp.json()
-            net_refs = data.get("nets", {}).get("netRef", [])
+            net_refs = resp.json().get("nets", {}).get("netRef", [])
             if isinstance(net_refs, dict):
                 net_refs = [net_refs]
             for ref in net_refs:
@@ -199,19 +197,17 @@ def get_hubspot_ip_ranges() -> list:
                 if not handle:
                     continue
                 try:
-                    net_resp = requests.get(
+                    nd = requests.get(
                         f"https://whois.arin.net/rest/net/{handle}",
                         headers=headers,
                         timeout=REQUEST_TIMEOUT,
-                    )
-                    net_resp.raise_for_status()
-                    net_data = net_resp.json()
-                    net_blocks = net_data.get("net", {}).get("netBlocks", {}).get("netBlock", [])
-                    if isinstance(net_blocks, dict):
-                        net_blocks = [net_blocks]
-                    for block in net_blocks:
-                        cidr = block.get("cidrLength", "")
-                        start = block.get("startAddress", "")
+                    ).json()
+                    blocks = nd.get("net", {}).get("netBlocks", {}).get("netBlock", [])
+                    if isinstance(blocks, dict):
+                        blocks = [blocks]
+                    for b in blocks:
+                        start = b.get("startAddress", "")
+                        cidr = b.get("cidrLength", "")
                         if start and cidr:
                             try:
                                 ranges.append(ipaddress.ip_network(f"{start}/{cidr}", strict=False))
@@ -226,7 +222,6 @@ def get_hubspot_ip_ranges() -> list:
 
 
 def _ip_in_hubspot_ranges(ip_str: str, ranges: list) -> bool:
-    """Check if an IP address is within any of the given HubSpot ranges."""
     try:
         addr = ipaddress.ip_address(ip_str)
         return any(addr in net for net in ranges)
@@ -235,94 +230,98 @@ def _ip_in_hubspot_ranges(ip_str: str, ranges: list) -> bool:
 
 
 def _resolve_a_records(host: str) -> list:
-    """Resolve A records for a hostname, returning list of IP strings."""
     try:
-        answers = dns.resolver.resolve(host, "A")
-        return [str(r.address) for r in answers]
+        return [str(r.address) for r in dns.resolver.resolve(host, "A")]
     except Exception:
         return []
 
 
-def check_dns(domain: str, result: DetectionResult):
-    """Check DNS records for HubSpot indicators."""
-    bare_domain = domain.lstrip("www.")
+# ---------------------------------------------------------------------------
+# DNS checks
+# ---------------------------------------------------------------------------
 
-    for subdomain in [bare_domain, f"www.{bare_domain}"]:
+def check_dns(domain: str, result: DetectionResult):
+    bare = domain.lstrip("www.")
+
+    # CNAME checks (main domain + www)
+    for subdomain in [bare, f"www.{bare}"]:
         try:
-            answers = dns.resolver.resolve(subdomain, "CNAME")
-            for rdata in answers:
+            for rdata in dns.resolver.resolve(subdomain, "CNAME"):
                 target = str(rdata.target).lower()
                 for indicator in HUBSPOT_DNS_CNAMES:
                     if indicator in target:
-                        note = ""
-                        if "hubspotpagebuilder.com" in target:
-                            note = " (free tier subdomain)"
-                        result.signals.append(
-                            f"DNS CNAME: {subdomain} -> {target}{note}"
-                        )
-        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
-                dns.resolver.NoNameservers, dns.resolver.Timeout,
-                Exception):
+                        note = " (free tier subdomain)" if "hubspotpagebuilder.com" in target else ""
+                        result.signals.append(f"DNS CNAME: {subdomain} -> {target}{note}")
+        except Exception:
             pass
 
+    # MX records
     try:
-        answers = dns.resolver.resolve(bare_domain, "MX")
-        for rdata in answers:
+        for rdata in dns.resolver.resolve(bare, "MX"):
             exchange = str(rdata.exchange).lower()
-            for mx_domain in HUBSPOT_MX_DOMAINS:
-                if mx_domain in exchange:
-                    result.signals.append(f"DNS MX: {exchange}")
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
-            dns.resolver.NoNameservers, dns.resolver.Timeout,
-            Exception):
+            if any(mx in exchange for mx in HUBSPOT_MX_DOMAINS):
+                result.signals.append(f"DNS MX: {exchange}")
+    except Exception:
         pass
 
+    # TXT / SPF records
     try:
-        answers = dns.resolver.resolve(bare_domain, "TXT")
-        for rdata in answers:
+        for rdata in dns.resolver.resolve(bare, "TXT"):
             txt = str(rdata).lower()
             if "hubspotemail" in txt:
-                result.signals.append("DNS TXT: HubSpot email marketing (paid)")
+                result.signals.append("DNS TXT SPF: _spf.hubspotemail.net → HubSpot email marketing (paid)")
+                if "Marketing Hub (email sending)" not in result.detected_products:
+                    result.detected_products.append("Marketing Hub (email sending)")
             elif "hubspot" in txt:
                 result.signals.append("DNS TXT: HubSpot verification record found")
-    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN,
-            dns.resolver.NoNameservers, dns.resolver.Timeout,
-            Exception):
+    except Exception:
         pass
 
+    # DKIM: hs1/hs2._domainkey.<domain> — set up during HubSpot email connection
+    for prefix in ("hs1._domainkey", "hs2._domainkey"):
+        try:
+            for rdata in dns.resolver.resolve(f"{prefix}.{bare}", "CNAME"):
+                target = str(rdata.target).lower()
+                if "hubspot" in target:
+                    result.signals.append(f"DNS CNAME (DKIM): {prefix}.{bare} → {target}")
+                    if "Marketing Hub (email sending)" not in result.detected_products:
+                        result.detected_products.append("Marketing Hub (email sending)")
+        except Exception:
+            pass
+
+    # em<n>.<domain> CNAME → hubspotemail.net (portal-specific DKIM sending domain)
+    for prefix in ("em1", "em2", "em3", "em4", "email"):
+        try:
+            for rdata in dns.resolver.resolve(f"{prefix}.{bare}", "CNAME"):
+                target = str(rdata.target).lower()
+                if "hubspotemail" in target:
+                    result.signals.append(f"DNS CNAME (DKIM): {prefix}.{bare} → {target}")
+                    if "Marketing Hub (email sending)" not in result.detected_products:
+                        result.detected_products.append("Marketing Hub (email sending)")
+                    break
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# HTTP checks
+# ---------------------------------------------------------------------------
 
 def check_http(domain: str, result: DetectionResult):
-    """Fetch the website and check HTTP headers and HTML content."""
-    urls_to_try = [f"https://{domain}", f"https://www.{domain}"]
     headers = {"User-Agent": USER_AGENT}
-
-    for url in urls_to_try:
+    for url in [f"https://{domain}", f"https://www.{domain}"]:
         try:
-            resp = requests.get(
-                url,
-                headers=headers,
-                timeout=REQUEST_TIMEOUT,
-                allow_redirects=True,
-            )
+            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True)
             resp.raise_for_status()
-            _check_headers(resp, result)
-            _check_html(resp.text, result)
-            _extract_portal_id(resp.text, result)
-            check_breeze(result.hubspot_portal_id, resp.text, result)
+            _process_response(resp, url, result)
             return
         except requests.exceptions.SSLError:
             try:
-                http_url = url.replace("https://", "http://")
                 resp = requests.get(
-                    http_url,
-                    headers=headers,
-                    timeout=REQUEST_TIMEOUT,
-                    allow_redirects=True,
+                    url.replace("https://", "http://"),
+                    headers=headers, timeout=REQUEST_TIMEOUT, allow_redirects=True,
                 )
-                _check_headers(resp, result)
-                _check_html(resp.text, result)
-                _extract_portal_id(resp.text, result)
-                check_breeze(result.hubspot_portal_id, resp.text, result)
+                _process_response(resp, url.replace("https://", "http://"), result)
                 return
             except Exception:
                 continue
@@ -330,45 +329,51 @@ def check_http(domain: str, result: DetectionResult):
             continue
 
 
+def _process_response(resp: requests.Response, url: str, result: DetectionResult):
+    """Run all per-page checks, then trigger multi-page and GTM fallbacks."""
+    _check_headers(resp, result)
+    _check_html(resp.text, result)
+    _extract_portal_id(resp.text, result)
+    check_breeze(result.hubspot_portal_id, resp.text, result)
+    if not result.hubspot_portal_id:
+        check_multi_page(url, resp.text, result)
+    if not result.hubspot_portal_id and result.gtm_ids:
+        check_gtm_containers(result.gtm_ids, result)
+
+
 def _check_headers(resp: requests.Response, result: DetectionResult):
-    """Check HTTP response headers for HubSpot indicators."""
-    resp_headers = {k.lower(): v for k, v in resp.headers.items()}
+    h = {k.lower(): v for k, v in resp.headers.items()}
 
     for indicator in HUBSPOT_HEADER_INDICATORS:
-        if indicator in resp_headers:
-            result.signals.append(
-                f"HTTP Header: {indicator}={resp_headers[indicator]}"
-            )
+        if indicator in h:
+            result.signals.append(f"HTTP Header: {indicator}={h[indicator]}")
 
-    server = resp_headers.get("server", "").lower()
+    server = h.get("server", "").lower()
     if "hubspot" in server:
         result.signals.append(f"HTTP Header: server={server}")
 
-    cookies = resp_headers.get("set-cookie", "").lower()
-    if "__hs" in cookies or "hubspot" in cookies:
+    if "__hs" in h.get("set-cookie", "").lower() or "hubspot" in h.get("set-cookie", "").lower():
         result.signals.append("HTTP Header: HubSpot cookie detected")
 
-    # CDN detection — used later by check_content_hub to flag inconclusive IP checks
-    server = resp_headers.get("server", "")
-    via = resp_headers.get("via", "")
-    if "cf-ray" in resp_headers or "cf-cache-status" in resp_headers or "cloudflare" in server:
+    # CDN detection — used by check_content_hub to flag inconclusive IP results
+    via = h.get("via", "").lower()
+    srv = h.get("server", "").lower()
+    if "cf-ray" in h or "cf-cache-status" in h or "cloudflare" in srv:
         result.cdn_masking = "Cloudflare"
-    elif "x-fastly-request-id" in resp_headers or "fastly" in server or "fastly" in via:
+    elif "x-fastly-request-id" in h or "fastly" in srv or "fastly" in via:
         result.cdn_masking = "Fastly"
-    elif "x-akamai-edgescape" in resp_headers or "akamai" in server or "akamai" in via:
+    elif "x-akamai-edgescape" in h or "akamai" in srv or "akamai" in via:
         result.cdn_masking = "Akamai"
-    elif "x-sucuri-id" in resp_headers or "sucuri" in server:
+    elif "x-sucuri-id" in h or "sucuri" in srv:
         result.cdn_masking = "Sucuri"
-    elif "x-iinfo" in resp_headers or "imperva" in server or "incapsula" in server:
+    elif "x-iinfo" in h or "imperva" in srv or "incapsula" in srv:
         result.cdn_masking = "Imperva"
 
 
 def _check_html(html: str, result: DetectionResult):
-    """Check HTML content for HubSpot markers."""
     for pattern in HUBSPOT_HTML_PATTERNS:
         if re.search(pattern, html, re.IGNORECASE):
-            match_label = pattern.replace(r"\.", ".").replace("\\", "")
-            result.signals.append(f"HTML pattern: {match_label}")
+            result.signals.append(f"HTML pattern: {pattern.replace(r'.', '.').replace(chr(92), '')}")
 
     soup = BeautifulSoup(html, "html.parser")
 
@@ -391,31 +396,35 @@ def _check_html(html: str, result: DetectionResult):
         if "hs-script-loader" in text or "hbspt" in text:
             result.signals.append("Inline script: HubSpot tracking code")
 
-    # Signal #7: Sales Hub Starter+ via meetings widget
     if re.search(r"meetings[\w\-]*\.hubspot\.com", html, re.IGNORECASE):
         result.signals.append("Sales Hub Starter+: meetings widget detected")
         if "Sales Hub Starter+" not in result.detected_products:
             result.detected_products.append("Sales Hub Starter+")
 
-    # Signal #10 (HTML part): Breeze Customer Agent chat widget
     if "hubspot-conversations-iframe" in html:
         result.signals.append("HubSpot Conversations chat widget")
 
-    # Extract form IDs for Signal #4
-    form_id_pattern = r'(?:formId|form_id)["\s:=]+["\']?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
-    for m in re.finditer(form_id_pattern, html, re.IGNORECASE):
+    # Collect form IDs for the Forms API check
+    for m in re.finditer(
+        r'(?:formId|form_id)["\s:=]+["\']?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',
+        html, re.IGNORECASE,
+    ):
         fid = m.group(1)
         if fid not in result.form_ids:
             result.form_ids.append(fid)
 
-    # Deduplicate signals
+    # Collect GTM container IDs for GTM parsing fallback
+    for gtm_id in re.findall(r'GTM-[A-Z0-9]{4,8}', html):
+        if gtm_id not in result.gtm_ids:
+            result.gtm_ids.append(gtm_id)
+
     result.signals = list(dict.fromkeys(result.signals))
 
 
 def _extract_portal_id(html: str, result: DetectionResult):
-    """Try to extract the HubSpot portal/hub ID from page source."""
-    patterns = [
-        r"js\.hs-scripts\.com/(\d+)\.js",
+    if result.hubspot_portal_id:
+        return
+    for pattern in [
         r"js[\w\-]*\.hs-scripts\.com/(\d+)\.js",
         r"js\.hsforms\.net/forms/v2\.js.*?portalId[\"':\s]+(\d+)",
         r"data-hsjs-portal=\"(\d+)\"",
@@ -423,189 +432,327 @@ def _extract_portal_id(html: str, result: DetectionResult):
         r"hbspt\.cta\.load\((\d+)",
         r"HubSpot[- ]?Portal[- ]?ID[\"':\s]+(\d+)",
         r"hs-hub-id[\"':\s]+(\d+)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, html, re.IGNORECASE)
-        if match:
-            portal_id = match.group(1)
-            result.hubspot_portal_id = portal_id
-            result.signals.append(f"Portal ID: {portal_id}")
+    ]:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            result.hubspot_portal_id = m.group(1)
+            result.signals.append(f"Portal ID: {m.group(1)}")
             return
 
 
+# ---------------------------------------------------------------------------
+# Multi-page scraping
+# ---------------------------------------------------------------------------
+
+def check_multi_page(base_url: str, homepage_html: str, result: DetectionResult):
+    """
+    Follow up to 3 links to contact/demo/pricing pages.
+    Most HubSpot forms and CTAs live on these pages, not the homepage.
+    Stops early once a portal ID is found.
+    """
+    base_host = urlparse(base_url).netloc
+    soup = BeautifulSoup(homepage_html, "html.parser")
+    candidates: list[str] = []
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        text = (a.get_text() or "").lower()
+        if any(kw in href.lower() or kw in text for kw in SECONDARY_PAGE_KEYWORDS):
+            full = urljoin(base_url, href)
+            p = urlparse(full)
+            if p.netloc == base_host and p.scheme in ("http", "https") and full not in candidates:
+                candidates.append(full)
+
+    for url in candidates[:3]:
+        if result.hubspot_portal_id:
+            break
+        try:
+            resp = requests.get(
+                url, headers={"User-Agent": USER_AGENT}, timeout=10, allow_redirects=True,
+            )
+            if resp.status_code != 200:
+                continue
+            _check_html(resp.text, result)
+            _extract_portal_id(resp.text, result)
+        except Exception:
+            continue
+
+
+# ---------------------------------------------------------------------------
+# GTM container parsing
+# ---------------------------------------------------------------------------
+
+def check_gtm_containers(gtm_ids: list, result: DetectionResult):
+    """
+    Fetch public GTM container bundles and search for HubSpot portal IDs.
+    Recovers portal IDs for sites that load HubSpot via tag manager rather
+    than a direct script tag — a common pattern that defeats static HTML checks.
+    """
+    for gtm_id in gtm_ids[:3]:
+        if result.hubspot_portal_id:
+            return
+        try:
+            resp = requests.get(
+                f"https://www.googletagmanager.com/gtm.js?id={gtm_id}",
+                headers={"User-Agent": USER_AGENT},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                continue
+            js = resp.text
+            _extract_portal_id(js, result)
+            if result.hubspot_portal_id:
+                result.signals.append(f"Portal ID recovered from GTM container ({gtm_id})")
+                return
+            if re.search(r"hs-scripts\.com", js, re.IGNORECASE):
+                result.signals.append(f"GTM ({gtm_id}): HubSpot tracking tag in container")
+        except Exception:
+            continue
+
+
+# ---------------------------------------------------------------------------
+# Auxiliary URL checks (robots.txt, sitemap)
+# ---------------------------------------------------------------------------
+
+def check_auxiliary_urls(domain: str, result: DetectionResult):
+    """
+    Check robots.txt and sitemap.xml for portal IDs.
+    HubSpot sitemaps and robots files often embed portal-specific paths.
+    """
+    if result.hubspot_portal_id:
+        return
+    bare = domain.lstrip("www.")
+    for path in ("/robots.txt", "/sitemap.xml", "/sitemap_index.xml"):
+        try:
+            resp = requests.get(
+                f"https://{bare}{path}",
+                headers={"User-Agent": USER_AGENT},
+                timeout=8,
+                allow_redirects=True,
+            )
+            if resp.status_code != 200:
+                continue
+            _extract_portal_id(resp.text, result)
+            if result.hubspot_portal_id:
+                result.signals.append(f"Portal ID found in {path}")
+                return
+        except Exception:
+            continue
+
+
+# ---------------------------------------------------------------------------
+# Proactive /_hcms/diagnostics (confirms Content Hub through CDNs)
+# ---------------------------------------------------------------------------
+
+def check_hcms_diagnostics_proactive(domain: str, result: DetectionResult):
+    """
+    Probe /_hcms/diagnostics on the bare domain and www subdomain.
+    HubSpot CMS sites return X-Hs-Portal-Id from this endpoint even when a
+    CDN sits in front, because CDNs pass /_hcms/* paths through to origin.
+    """
+    if "Content Hub Pro" in result.detected_products:
+        return
+    bare = domain.lstrip("www.")
+    for host in (bare, f"www.{bare}"):
+        try:
+            resp = requests.get(
+                f"https://{host}/_hcms/diagnostics",
+                headers={"User-Agent": USER_AGENT},
+                timeout=10,
+                allow_redirects=True,
+            )
+            pid = (
+                resp.headers.get("X-Hs-Portal-Id")
+                or resp.headers.get("x-hs-portal-id")
+                or resp.headers.get("x-hs-hub-id")
+            )
+            if pid:
+                if not result.hubspot_portal_id:
+                    result.hubspot_portal_id = pid
+                    result.signals.append(f"Portal ID (/_hcms/diagnostics): {pid}")
+                result.signals.append(f"Content Hub Pro: /_hcms/diagnostics confirmed ({host})")
+                if "Content Hub Pro" not in result.detected_products:
+                    result.detected_products.append("Content Hub Pro")
+                return
+        except Exception:
+            continue
+
+
+# ---------------------------------------------------------------------------
+# Tier-specific API checks
+# ---------------------------------------------------------------------------
+
 def check_form_api(portal_id: str, form_ids: list, result: DetectionResult):
-    """Signal #4: Check form configs via HubSpot Forms API."""
+    """
+    Query the public HubSpot Forms embed API for tier signals.
+    Smart fields and conditional logic require Marketing Hub Pro+.
+    sfdcCampaignId indicates Salesforce integration (Sales Hub Enterprise).
+    noBranding is noted as a paying-customer signal but not used for tier.
+    """
     if not portal_id or not form_ids:
         return
-    headers = {"User-Agent": USER_AGENT}
     for fid in form_ids[:5]:
         try:
-            url = f"https://forms.hsforms.com/embed/v3/form/{portal_id}/{fid}/json"
-            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            resp = requests.get(
+                f"https://forms.hsforms.com/embed/v3/form/{portal_id}/{fid}/json",
+                headers={"User-Agent": USER_AGENT},
+                timeout=REQUEST_TIMEOUT,
+            )
             if resp.status_code != 200:
                 continue
             data = resp.json()
-            fields = data.get("fields", []) or data.get("formFieldGroups", [])
-            # Flatten groups if needed
-            flat_fields = []
-            for f in fields:
-                if isinstance(f, dict) and "fields" in f:
-                    flat_fields.extend(f.get("fields", []))
-                else:
-                    flat_fields.append(f)
+            form = data.get("form", data)
+
+            flat_fields: list = []
+            for g in form.get("formFieldGroups", []):
+                flat_fields.extend(g.get("fields", []) if isinstance(g, dict) else [])
+            flat_fields.extend(form.get("fields", []))
+
             for ff in flat_fields:
                 if ff.get("isSmartField") or ff.get("isSmartGroup"):
+                    result.signals.append("Marketing Hub Pro: smart field in form")
                     if "Marketing Hub Pro" not in result.detected_products:
                         result.detected_products.append("Marketing Hub Pro")
-                    result.signals.append("Marketing Hub Pro: smart field detected in form")
                 if ff.get("dependentFieldFilters"):
+                    result.signals.append("Marketing Hub Pro: conditional field logic in form")
                     if "Marketing Hub Pro" not in result.detected_products:
                         result.detected_products.append("Marketing Hub Pro")
-                    result.signals.append("Marketing Hub Pro: dependent field filters in form")
-            scopes = data.get("scopes", []) or []
-            if "noBranding" in scopes:
-                if "Marketing Hub Starter+" not in result.detected_products:
-                    result.detected_products.append("Marketing Hub Starter+")
-                result.signals.append("Marketing Hub Starter+: noBranding scope in form")
-            if data.get("sfdcCampaignId"):
+
+            if "noBranding" in (form.get("scopes") or []):
+                # noBranding just means paying customer — don't use it for tier classification
+                result.signals.append("Form: noBranding (paying customer confirmed)")
+
+            if form.get("sfdcCampaignId"):
+                result.signals.append("Sales Hub Enterprise: Salesforce campaign ID in form")
                 if "Sales Hub Enterprise" not in result.detected_products:
                     result.detected_products.append("Sales Hub Enterprise")
-                result.signals.append("Sales Hub Enterprise: Salesforce campaign ID in form")
         except Exception:
-            pass
+            continue
 
 
 def check_popup_api(portal_id: str, result: DetectionResult):
-    """Signal #5: Check popup audience configs for Marketing Hub Pro."""
+    """campaignGuid in sortedAudienceConfigs → Marketing Hub Pro+ (low recall, zero false positives)."""
     if not portal_id:
         return
     try:
-        url = f"https://api.hubspot.com/web-interactives/v1/public/audiences/{portal_id}"
-        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
+        resp = requests.get(
+            f"https://api.hubspot.com/web-interactives/v1/public/audiences/{portal_id}",
+            headers={"User-Agent": USER_AGENT},
+            timeout=REQUEST_TIMEOUT,
+        )
         if resp.status_code != 200:
             return
-        data = resp.json()
-        configs = data.get("sortedAudienceConfigs", []) or []
-        for cfg in configs:
-            if cfg.get("campaignGuid") is not None:
+        for cfg in resp.json().get("sortedAudienceConfigs", []) or []:
+            if cfg.get("campaignGuid"):
+                result.signals.append("Marketing Hub Pro: popup campaignGuid found")
                 if "Marketing Hub Pro" not in result.detected_products:
                     result.detected_products.append("Marketing Hub Pro")
-                result.signals.append("Marketing Hub Pro: popup audience config with campaignGuid")
                 break
     except Exception:
         pass
 
 
 def check_tracking_script(portal_id: str, result: DetectionResult):
-    """Signal #8: Check analytics script for Marketing Hub Enterprise indicators."""
+    """trackingConfigId + pe<portalId>_ event names in analytics script → Marketing Hub Enterprise."""
     if not portal_id:
         return
-    headers = {"User-Agent": USER_AGENT}
     for region in ("na1", "eu1"):
         try:
-            url = f"https://js-{region}.hs-analytics.net/analytics/0/{portal_id}.js"
-            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            resp = requests.get(
+                f"https://js-{region}.hs-analytics.net/analytics/0/{portal_id}.js",
+                headers={"User-Agent": USER_AGENT},
+                timeout=REQUEST_TIMEOUT,
+            )
             if resp.status_code != 200:
                 continue
-            text = resp.text
-            has_tracking_config = bool(re.search(r'"trackingConfigId"\s*:\s*\d+', text))
-            has_pe_event = bool(re.search(rf'"pe{portal_id}_\w+"', text))
-            if has_tracking_config and has_pe_event:
+            js = resp.text
+            if re.search(r'"trackingConfigId"\s*:\s*\d+', js) and re.search(rf'"pe{portal_id}_\w+"', js):
+                result.signals.append("Marketing Hub Enterprise: custom event tracking in analytics script")
                 if "Marketing Hub Enterprise" not in result.detected_products:
                     result.detected_products.append("Marketing Hub Enterprise")
-                result.signals.append("Marketing Hub Enterprise: custom event tracking in analytics script")
-            break
+            return
         except Exception:
-            pass
+            continue
 
+
+# ---------------------------------------------------------------------------
+# Infrastructure checks
+# ---------------------------------------------------------------------------
 
 def check_content_hub(domain: str, result: DetectionResult, hubspot_ranges: list):
-    """Signal #1: Check if domain hosts resolve to HubSpot IP ranges (Content Hub Pro+)."""
-    bare_domain = domain.lstrip("www.")
-    hosts_to_check = [bare_domain, f"www.{bare_domain}", f"blog.{bare_domain}"]
-    req_headers = {"User-Agent": USER_AGENT}
-
-    for host in hosts_to_check:
-        ips = _resolve_a_records(host)
-        for ip in ips:
+    """A records for domain/www/blog against HubSpot IP ranges → Content Hub Pro."""
+    bare = domain.lstrip("www.")
+    for host in (bare, f"www.{bare}", f"blog.{bare}"):
+        for ip in _resolve_a_records(host):
             if _ip_in_hubspot_ranges(ip, hubspot_ranges):
-                result.signals.append(f"Content Hub Pro: {host} ({ip}) -> HubSpot infrastructure")
+                result.signals.append(f"Content Hub Pro: {host} ({ip}) → HubSpot infrastructure")
                 if "Content Hub Pro" not in result.detected_products:
                     result.detected_products.append("Content Hub Pro")
-                # Try to get portal ID from diagnostics endpoint
                 if not result.hubspot_portal_id:
                     try:
-                        diag_url = f"https://{host}/_hcms/diagnostics"
-                        diag_resp = requests.get(
-                            diag_url,
-                            headers=req_headers,
+                        r = requests.get(
+                            f"https://{host}/_hcms/diagnostics",
+                            headers={"User-Agent": USER_AGENT},
                             timeout=REQUEST_TIMEOUT,
                             allow_redirects=True,
                         )
-                        pid = diag_resp.headers.get("X-Hs-Portal-Id", "")
+                        pid = r.headers.get("X-Hs-Portal-Id", "")
                         if pid:
                             result.hubspot_portal_id = pid
                             result.signals.append(f"Portal ID: {pid}")
                     except Exception:
                         pass
                 return
-
-    # No HubSpot IPs found — flag if a CDN is masking the origin
     if result.cdn_masking:
         result.signals.append(
-            f"Content Hub: {result.cdn_masking} CDN detected — IP check inconclusive, may be hosted on HubSpot"
+            f"Content Hub: {result.cdn_masking} CDN detected — IP check inconclusive, may be on HubSpot"
         )
 
 
 def check_service_hub(domain: str, result: DetectionResult, hubspot_ranges: list):
-    """Signal #6: Check support subdomains against HubSpot IP ranges (Service Hub Pro)."""
-    bare_domain = domain.lstrip("www.")
-    subdomains = ["support", "help", "docs", "kb", "knowledge"]
-
-    for sub in subdomains:
-        host = f"{sub}.{bare_domain}"
-        ips = _resolve_a_records(host)
-        for ip in ips:
+    """support/help/docs/kb/knowledge subdomains on HubSpot IPs → Service Hub Pro."""
+    bare = domain.lstrip("www.")
+    for sub in ("support", "help", "docs", "kb", "knowledge"):
+        host = f"{sub}.{bare}"
+        for ip in _resolve_a_records(host):
             if _ip_in_hubspot_ranges(ip, hubspot_ranges):
-                result.signals.append(f"Service Hub Pro: {host} ({ip}) -> HubSpot infrastructure")
+                result.signals.append(f"Service Hub Pro: {host} ({ip}) → HubSpot infrastructure")
                 if "Service Hub Pro" not in result.detected_products:
                     result.detected_products.append("Service Hub Pro")
                 break
 
 
 def check_breeze(portal_id: str, html: str, result: DetectionResult):
-    """Signal #10: Check for Breeze Customer Agent indicators."""
-    if "hubspot-conversations-iframe" not in html:
+    """Breeze Customer Agent: AI routing/responder fields in livechat config API."""
+    if "hubspot-conversations-iframe" not in html or not portal_id:
         return
-    if not portal_id:
-        return
-    req_headers = {"User-Agent": USER_AGENT}
     for region in ("na1", "eu1"):
         try:
-            url = (
-                f"https://api-{region}.hubspot.com/livechat-public/v1/message/public"
-                f"?portalId={portal_id}"
+            resp = requests.get(
+                f"https://api-{region}.hubspot.com/livechat-public/v1/message/public",
+                params={"portalId": portal_id},
+                headers={"User-Agent": USER_AGENT},
+                timeout=REQUEST_TIMEOUT,
             )
-            resp = requests.get(url, headers=req_headers, timeout=REQUEST_TIMEOUT)
             if resp.status_code != 200:
                 continue
             data = resp.json()
-            is_breeze = False
-            if data.get("routingRuleDefinitionAI") is True:
-                is_breeze = True
-            if data.get("recommendedQuestionsForAgent"):
-                is_breeze = True
-            send_from = data.get("sendFrom", []) or []
-            if any(entry.get("isResponderAI") is True for entry in send_from):
-                is_breeze = True
-            if is_breeze:
+            if (
+                data.get("routingRuleDefinitionAI") is True
+                or data.get("recommendedQuestionsForAgent")
+                or any(e.get("isResponderAI") for e in data.get("sendFrom", []) or [])
+            ):
+                result.signals.append("Breeze Customer Agent: AI routing/responder detected")
                 if "Breeze Customer Agent" not in result.detected_products:
                     result.detected_products.append("Breeze Customer Agent")
-                result.signals.append("Breeze Customer Agent: AI routing/responder detected")
             break
         except Exception:
-            pass
+            continue
 
+
+# ---------------------------------------------------------------------------
+# Main detection entry point
+# ---------------------------------------------------------------------------
 
 def detect_hubspot(company: str, domain: str) -> DetectionResult:
     """Run all detection methods for a single domain."""
@@ -618,7 +765,12 @@ def detect_hubspot(company: str, domain: str) -> DetectionResult:
 
     try:
         check_dns(normalized, result)
-        check_http(normalized, result)
+        check_http(normalized, result)           # includes multi-page + GTM fallback
+        check_auxiliary_urls(normalized, result)  # robots.txt / sitemap portal ID
+
+        # Proactive Content Hub confirmation — works through CDNs
+        if result.signals:
+            check_hcms_diagnostics_proactive(normalized, result)
 
         if result.hubspot_portal_id:
             check_form_api(result.hubspot_portal_id, result.form_ids, result)
@@ -639,61 +791,45 @@ def detect_hubspot(company: str, domain: str) -> DetectionResult:
     return result
 
 
+# ---------------------------------------------------------------------------
+# CSV I/O and CLI
+# ---------------------------------------------------------------------------
+
 def read_input_csv(path: str) -> list[dict]:
-    """Read input CSV and return list of {company, domain} dicts."""
     rows = []
     filepath = Path(path)
     if not filepath.exists():
         logger.error("Input file not found: %s", path)
         sys.exit(1)
-
     with open(filepath, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
-        fieldnames = [fn.lower().strip() for fn in (reader.fieldnames or [])]
-
-        company_col = None
-        domain_col = None
-
+        company_col = domain_col = None
         for fn in reader.fieldnames or []:
             lower = fn.lower().strip()
             if lower in ("company", "company name", "company_name", "name"):
                 company_col = fn
             elif lower in ("domain", "website", "url", "site", "web"):
                 domain_col = fn
-
         if domain_col is None:
             logger.error(
-                "Could not find a domain column. Expected one of: "
-                "domain, website, url, site, web. "
-                "Found columns: %s",
-                reader.fieldnames,
+                "Could not find a domain column. Expected: domain, website, url, site, web. "
+                "Found: %s", reader.fieldnames,
             )
             sys.exit(1)
-
         for row in reader:
             domain = (row.get(domain_col) or "").strip()
             company = (row.get(company_col) or domain).strip() if company_col else domain
             if domain:
                 rows.append({"company": company, "domain": domain})
-
     logger.info("Loaded %d entries from %s", len(rows), path)
     return rows
 
 
 def write_output_csv(results: list[DetectionResult], path: str):
-    """Write detection results to a CSV file."""
     fieldnames = [
-        "company",
-        "domain",
-        "uses_hubspot",
-        "confidence",
-        "hubspot_tier",
-        "detected_products",
-        "hubspot_portal_id",
-        "signals",
-        "error",
+        "company", "domain", "uses_hubspot", "confidence",
+        "hubspot_tier", "detected_products", "hubspot_portal_id", "signals", "error",
     ]
-
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -709,62 +845,36 @@ def write_output_csv(results: list[DetectionResult], path: str):
                 "signals": " | ".join(r.signals),
                 "error": r.error,
             })
-
     logger.info("Results written to %s", path)
 
 
 def print_summary(results: list[DetectionResult]):
-    """Print a summary table to stdout."""
     total = len(results)
     using = sum(1 for r in results if r.uses_hubspot)
     errors = sum(1 for r in results if r.error)
-
     print("\n" + "=" * 90)
     print(f"{'HUBSPOT DETECTION RESULTS':^90}")
     print("=" * 90)
-    print(f"  Total domains checked : {total}")
-    print(f"  Using HubSpot         : {using}")
-    print(f"  Not using HubSpot     : {total - using - errors}")
-    print(f"  Errors                : {errors}")
+    print(f"  Total checked  : {total}")
+    print(f"  Using HubSpot  : {using}")
+    print(f"  Not using      : {total - using - errors}")
+    print(f"  Errors         : {errors}")
     print("-" * 90)
     print(f"  {'Company':<25} {'Domain':<25} {'HubSpot?':<10} {'Confidence':<12} {'Tier':<12} {'Products'}")
     print("-" * 90)
-
     for r in sorted(results, key=lambda x: x.uses_hubspot, reverse=True):
-        hubspot_str = "Yes" if r.uses_hubspot else ("Error" if r.error else "No")
-        products_str = " | ".join(r.detected_products) or "—"
-        print(
-            f"  {r.company[:24]:<25} {r.domain[:24]:<25} {hubspot_str:<10} "
-            f"{r.confidence:<12} {r.hubspot_tier:<12} {products_str}"
-        )
-
+        status = "Yes" if r.uses_hubspot else ("Error" if r.error else "No")
+        products = " | ".join(r.detected_products) or "—"
+        print(f"  {r.company[:24]:<25} {r.domain[:24]:<25} {status:<10} {r.confidence:<12} {r.hubspot_tier:<12} {products}")
     print("=" * 90 + "\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Detect HubSpot usage for a list of company domains.",
-    )
-    parser.add_argument(
-        "input_csv",
-        help="Path to input CSV file with 'company' and 'domain' columns",
-    )
-    parser.add_argument(
-        "-o", "--output",
-        default="hubspot_results.csv",
-        help="Path to output CSV file (default: hubspot_results.csv)",
-    )
-    parser.add_argument(
-        "-w", "--workers",
-        type=int,
-        default=MAX_WORKERS,
-        help=f"Number of concurrent workers (default: {MAX_WORKERS})",
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable verbose/debug logging",
-    )
+    parser = argparse.ArgumentParser(description="Detect HubSpot usage for a list of company domains.")
+    parser.add_argument("input_csv")
+    parser.add_argument("-o", "--output", default="hubspot_results.csv")
+    parser.add_argument("-w", "--workers", type=int, default=MAX_WORKERS)
+    parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
     if args.verbose:
@@ -780,7 +890,6 @@ def main():
 
     results: list[DetectionResult] = []
     workers = min(args.workers, len(entries))
-
     logger.info("Checking %d domains with %d workers...", len(entries), workers)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
@@ -788,10 +897,7 @@ def main():
             executor.submit(detect_hubspot, e["company"], e["domain"]): e
             for e in entries
         }
-
-        for i, future in enumerate(
-            concurrent.futures.as_completed(future_to_entry), 1
-        ):
+        for i, future in enumerate(concurrent.futures.as_completed(future_to_entry), 1):
             entry = future_to_entry[future]
             try:
                 result = future.result()
@@ -803,22 +909,10 @@ def main():
                     status, result.confidence, result.hubspot_tier,
                 )
             except Exception as e:
-                err_result = DetectionResult(
-                    company=entry["company"],
-                    domain=entry["domain"],
-                    error=str(e),
-                )
-                results.append(err_result)
-                logger.error(
-                    "[%d/%d] %s - Error: %s",
-                    i, len(entries), entry["domain"], e,
-                )
+                results.append(DetectionResult(company=entry["company"], domain=entry["domain"], error=str(e)))
+                logger.error("[%d/%d] %s - Error: %s", i, len(entries), entry["domain"], e)
 
-    confidence_order = {"high": 0, "medium": 1, "low": 2, "none": 3}
-    results.sort(
-        key=lambda r: (not r.uses_hubspot, confidence_order.get(r.confidence, 4))
-    )
-
+    results.sort(key=lambda r: (not r.uses_hubspot, {"high": 0, "medium": 1, "low": 2, "none": 3}.get(r.confidence, 4)))
     write_output_csv(results, args.output)
     print_summary(results)
 
