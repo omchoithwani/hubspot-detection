@@ -16,7 +16,7 @@ import time
 import pandas as pd
 import streamlit as st
 
-from hubspot_detector import detect_hubspot, DetectionResult, MAX_WORKERS
+from hubspot_detector import detect_hubspot, DetectionResult, MAX_WORKERS, get_hubspot_ip_ranges
 from hubspot_api import (
     test_connection,
     fetch_companies_missing_property,
