@@ -16,7 +16,7 @@ import time
 import pandas as pd
 import streamlit as st
 
-from hubspot_detector import detect_hubspot, DetectionResult, MAX_WORKERS
+from hubspot_detector import detect_hubspot, DetectionResult, MAX_WORKERS, get_hubspot_ip_ranges
 from hubspot_api import (
     test_connection,
     fetch_companies_missing_property,
@@ -181,7 +181,7 @@ with tab_single:
             if result.error:
                 st.error(f"Error checking {domain}: {result.error}")
             else:
-                col_r1, col_r2, col_r3 = st.columns(3)
+                col_r1, col_r2, col_r3, col_r4 = st.columns(4)
                 with col_r1:
                     if result.uses_hubspot:
                         st.metric("Uses HubSpot", "Yes")
@@ -191,6 +191,11 @@ with tab_single:
                     st.metric("Confidence", result.confidence.capitalize())
                 with col_r3:
                     st.metric("Portal ID", result.hubspot_portal_id or "—")
+                with col_r4:
+                    st.metric("Tier", result.hubspot_tier.capitalize())
+
+                if result.detected_products:
+                    st.markdown("**Detected Products:** " + ", ".join(result.detected_products))
 
                 if result.signals:
                     st.subheader("Detection Signals")
@@ -268,6 +273,9 @@ with tab_bulk:
 
             actual_workers = min(workers, len(entries))
 
+            with st.spinner("Loading HubSpot IP ranges..."):
+                get_hubspot_ip_ranges()
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
                 future_to_entry = {
                     executor.submit(detect_hubspot, e["company"], e["domain"]): e
@@ -331,6 +339,8 @@ with tab_bulk:
                     "Domain": r.domain,
                     "Uses HubSpot": "Yes" if r.uses_hubspot else ("Error" if r.error else "No"),
                     "Confidence": r.confidence.capitalize(),
+                    "Tier": r.hubspot_tier.capitalize(),
+                    "Products": " | ".join(r.detected_products) or "—",
                     "Portal ID": r.hubspot_portal_id or "—",
                     "Signals": " | ".join(r.signals) if r.signals else "—",
                     "Error": r.error or "",
@@ -355,10 +365,22 @@ with tab_bulk:
                 }
                 return styles.get(val, "")
 
+            def style_tier(val):
+                styles = {
+                    "Enterprise": "color: #6f42c1; font-weight: 600",
+                    "Pro": "color: #fd7e14; font-weight: 600",
+                    "Starter": "color: #007bff; font-weight: 600",
+                    "Free": "color: #6c757d",
+                    "Unknown": "color: #6c757d",
+                }
+                return styles.get(val, "")
+
             styled_df = df_results.style.map(
                 style_hubspot, subset=["Uses HubSpot"]
             ).map(
                 style_confidence, subset=["Confidence"]
+            ).map(
+                style_tier, subset=["Tier"]
             )
 
             st.dataframe(styled_df, use_container_width=True, hide_index=True, height=min(600, 35 * len(rows) + 38))
@@ -376,6 +398,8 @@ with tab_bulk:
                     "domain": r.domain,
                     "uses_hubspot": r.uses_hubspot,
                     "confidence": r.confidence,
+                    "hubspot_tier": r.hubspot_tier,
+                    "detected_products": " | ".join(r.detected_products),
                     "hubspot_portal_id": r.hubspot_portal_id,
                     "signals": " | ".join(r.signals),
                     "error": r.error,
@@ -472,6 +496,9 @@ with tab_hubspot:
                     start_time = time.time()
 
                     actual_workers = min(workers, len(companies))
+
+                    with st.spinner("Loading HubSpot IP ranges..."):
+                        get_hubspot_ip_ranges()
 
                     with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
                         future_to_company = {
