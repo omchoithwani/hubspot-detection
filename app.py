@@ -24,16 +24,12 @@ from hubspot_api import (
 )
 from google_sheets import get_client as _gsheets_get_client, get_worksheet, upsert_results, extract_sheet_id
 
-@st.cache_resource
 def _get_sheets_client():
     try:
         info = dict(st.secrets["gcp_service_account"])
-        # Streamlit stores the private key with literal \n — convert to real newlines
-        if "private_key" in info:
-            info["private_key"] = info["private_key"].replace("\\n", "\n")
         return _gsheets_get_client(info)
     except Exception as e:
-        return str(e)  # return error message so we can show it
+        return str(e)
 
 
 # ---------------------------------------------------------------------------

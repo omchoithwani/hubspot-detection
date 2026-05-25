@@ -25,7 +25,14 @@ _DOMAIN_COL_IDX = 1  # 0-indexed; Domain is column B
 
 
 def get_client(service_account_info: dict) -> gspread.Client:
-    creds = Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
+    info = dict(service_account_info)
+    if "private_key" in info:
+        key = str(info["private_key"])
+        key = key.replace("\\n", "\n")   # literal \n → real newlines
+        key = key.replace("\r\n", "\n")  # normalise CRLF
+        key = key.strip()
+        info["private_key"] = key
+    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds)
 
 
