@@ -97,6 +97,8 @@ def upsert_results(ws: gspread.Worksheet, results: list[DetectionResult]) -> tup
         key = r.domain.lower().strip()
         if key in domain_to_row:
             row_idx = domain_to_row[key]
+            if row_idx == -1:
+                continue  # duplicate in this batch, already queued for append
             batch_updates.append({
                 "range": f"A{row_idx}:{col_end}{row_idx}",
                 "values": [row_data],
