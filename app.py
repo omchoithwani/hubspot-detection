@@ -29,8 +29,8 @@ def _get_sheets_client():
     try:
         info = dict(st.secrets["gcp_service_account"])
         return _gsheets_get_client(info)
-    except Exception:
-        return None
+    except Exception as e:
+        return str(e)  # return error message so we can show it
 
 
 # ---------------------------------------------------------------------------
@@ -135,10 +135,11 @@ with st.sidebar:
     if _sheet_url_input.strip():
         _sheets_client = _get_sheets_client()
         _sheets_sheet_id = extract_sheet_id(_sheet_url_input)
-        if _sheets_client is None:
+        if _sheets_client is None or isinstance(_sheets_client, str):
             st.warning(
-                "No service account found in secrets.toml."
+                f"Google Sheets auth failed: {_sheets_client or 'No service account in secrets.'}"
             )
+            _sheets_client = None
         else:
             try:
                 _ws_test = get_worksheet(_sheets_client, _sheets_sheet_id)
