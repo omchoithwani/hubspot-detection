@@ -123,6 +123,33 @@ with st.sidebar:
     )
 
     st.divider()
+    st.subheader("Google Sheets Sync")
+    _sheet_url_input = st.text_input(
+        "Sheet URL or ID",
+        placeholder="https://docs.google.com/spreadsheets/d/...",
+        help=(
+            "Paste your Google Sheet URL or ID. Results will be upserted here "
+            "after every detection run. Share the sheet with your service account email first."
+        ),
+    )
+    if _sheet_url_input.strip():
+        _sheets_client = _get_sheets_client()
+        _sheets_sheet_id = extract_sheet_id(_sheet_url_input)
+        if _sheets_client is None:
+            st.warning(
+                "No service account found in secrets.toml."
+            )
+        else:
+            try:
+                _ws_test = get_worksheet(_sheets_client, _sheets_sheet_id)
+                st.success("Connected to Google Sheets")
+            except Exception as _e:
+                st.error(f"Cannot open sheet: {_e}")
+                _sheets_client = None
+    else:
+        st.caption("Paste a sheet URL above to auto-save results after each run.")
+
+    st.divider()
     st.subheader("CSV format example")
     st.code("company,domain\nAcme Corp,acme.com\nWidgets Inc,widgets.io", language="csv")
 
@@ -149,32 +176,6 @@ with st.sidebar:
         - **Portal ID extraction** — identifies the HubSpot account
         """
     )
-
-    st.divider()
-    st.subheader("Google Sheets Sync")
-    _sheet_url_input = st.text_input(
-        "Sheet ID or URL",
-        placeholder="https://docs.google.com/spreadsheets/d/...",
-        help=(
-            "Paste your Google Sheet URL or ID. Results will be upserted here "
-            "after every detection run. Share the sheet with your service account email first."
-        ),
-    )
-    if _sheet_url_input.strip():
-        _sheets_client = _get_sheets_client()
-        _sheets_sheet_id = extract_sheet_id(_sheet_url_input)
-        if _sheets_client is None:
-            st.warning(
-                "No service account found. Add **[gcp_service_account]** to your "
-                "`.streamlit/secrets.toml` file."
-            )
-        else:
-            try:
-                _ws_test = get_worksheet(_sheets_client, _sheets_sheet_id)
-                st.success("Connected to Google Sheets")
-            except Exception as _e:
-                st.error(f"Cannot open sheet: {_e}")
-                _sheets_client = None
 
 def _sync_to_sheets(results: list, label: str = "") -> None:
     """Upsert results into the configured Google Sheet and show a status message."""
